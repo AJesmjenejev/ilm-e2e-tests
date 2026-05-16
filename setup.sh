@@ -25,9 +25,40 @@ step()  { echo ""; echo -e "${BOLD}── $* ${NC}"; }
 
 # --- Configuration -----------------------------------------------------------
 
+REPO_DIR="$(pwd)"
 ILM_HOME="${ILM_HOME:-$HOME/ilm-local}"
 GITHUB_BASE="https://github.com/OmniTrustILM"
 HELM_RAW="https://raw.githubusercontent.com/OmniTrustILM/helm-charts/main/dummy-certificates/certs"
+
+# On Windows (Git Bash), $HOME resolves to /c/Users/... but Docker Compose
+# requires a Windows-style path (C:/Users/...). Convert if needed.
+to_docker_path() {
+  local p="$1"
+  case "$(uname -s)" in
+    MINGW*|CYGWIN*|MSYS*)
+      # /c/Users/foo → C:/Users/foo
+      echo "$p" | sed 's|^/\([a-zA-Z]\)/|\1:/|'
+      ;;
+    *)
+      echo "$p"
+      ;;
+  esac
+}
+
+DOCKER_ILM_HOME="$(to_docker_path "$ILM_HOME")"
+DOCKER_REPO_DIR="$(to_docker_path "$REPO_DIR")"
+
+# COMMON_TMPDIR is initialized after the prerequisite check (requires node).
+COMMON_TMPDIR=""
+
+# On Windows Git Bash, docker cp translates /tmp/... paths incorrectly.
+# MSYS_NO_PATHCONV=1 disables that translation.
+docker_cp() {
+  case "$(uname -s)" in
+    MINGW*|CYGWIN*|MSYS*) MSYS_NO_PATHCONV=1 docker cp "$@" ;;
+    *)                     docker cp "$@" ;;
+  esac
+}
 
 # --- Banner ------------------------------------------------------------------
 
@@ -42,18 +73,26 @@ echo ""
 
 step "1 — Prerequisites"
 
+MISSING=()
+
 check_cmd() {
   if command -v "$1" &>/dev/null; then
     ok "$1 found ($(command -v "$1"))"
   else
-    die "$1 not found — install it and re-run. $2"
+    echo -e "${RED}[FAIL]${NC}  $1 not found. $2"
+    MISSING+=("$1")
   fi
 }
 
-check_cmd git  "https://git-scm.com"
-check_cmd node "https://nodejs.org (18+ required)"
-check_cmd docker "https://docker.com/products/docker-desktop"
-check_cmd curl ""
+check_cmd git    "Install from https://git-scm.com"
+check_cmd node   "Install Node.js 18+ from https://nodejs.org"
+check_cmd docker "Install Docker Desktop from https://docker.com/products/docker-desktop"
+check_cmd curl   "Install curl with your package manager"
+
+if (( ${#MISSING[@]} > 0 )); then
+  echo ""
+  die "Missing prerequisites: ${MISSING[*]}. Install them and re-run."
+fi
 
 NODE_MAJOR=$(node -e "console.log(process.versions.node.split('.')[0])")
 if (( NODE_MAJOR < 18 )); then
@@ -65,6 +104,10 @@ if ! docker info &>/dev/null 2>&1; then
   die "Docker daemon is not running. Start Docker Desktop and try again."
 fi
 ok "Docker daemon is running"
+
+# Now that node is verified, set the shared temp dir.
+# On Windows, /tmp in Git Bash ≠ C:\tmp in Node.js — os.tmpdir() gives the real one.
+COMMON_TMPDIR=$(node -e "process.stdout.write(require('os').tmpdir().replace(/\\\\/g, '/'))")
 
 # --- Step 2: Clone repositories ----------------------------------------------
 
@@ -104,12 +147,12 @@ fi
 # Update CZERTAINLY_SOURCES_BASE_DIR to the current ILM_HOME
 if grep -q "^CZERTAINLY_SOURCES_BASE_DIR=" .env; then
   # macOS sed requires a backup extension
-  sed -i.bak "s|^CZERTAINLY_SOURCES_BASE_DIR=.*|CZERTAINLY_SOURCES_BASE_DIR=${ILM_HOME}|" .env
+  sed -i.bak "s|^CZERTAINLY_SOURCES_BASE_DIR=.*|CZERTAINLY_SOURCES_BASE_DIR=${DOCKER_ILM_HOME}|" .env
   rm -f .env.bak
 else
-  echo "CZERTAINLY_SOURCES_BASE_DIR=${ILM_HOME}" >> .env
+  echo "CZERTAINLY_SOURCES_BASE_DIR=${DOCKER_ILM_HOME}" >> .env
 fi
-ok "CZERTAINLY_SOURCES_BASE_DIR=${ILM_HOME}"
+ok "CZERTAINLY_SOURCES_BASE_DIR=${DOCKER_ILM_HOME}"
 
 # --- Step 4: Trusted certificates --------------------------------------------
 
@@ -159,13 +202,13 @@ step "6 — Register first administrator"
 info "Downloading dummy admin certificate..."
 curl -sf "${HELM_RAW}/admin.cert.pem" \
   | grep -A 9999 "BEGIN CERTIFICATE" | grep -v "BEGIN\|END" | tr -d '\n' \
-  > /tmp/ilm_admin_cert_b64.txt
+  > $COMMON_TMPDIR/ilm_admin_cert_b64.txt
 ok "Admin certificate downloaded"
 
 # Check if admin already registered
 CERT_URL=$(node -e "
 const fs = require('fs');
-process.stdout.write(encodeURIComponent(fs.readFileSync('/tmp/ilm_admin_cert_b64.txt','utf8').trim()));
+process.stdout.write(encodeURIComponent(fs.readFileSync('$COMMON_TMPDIR/ilm_admin_cert_b64.txt','utf8').trim()));
 ")
 
 PROFILE_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
@@ -175,24 +218,18 @@ PROFILE_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
 if [[ "$PROFILE_STATUS" == "200" ]]; then
   warn "Administrator already registered — skipping"
 else
-  CERT_B64=$(cat /tmp/ilm_admin_cert_b64.txt)
-  cat > /tmp/ilm_first_admin.json << EOF
-{
-  "username": "admin",
-  "firstname": "Admin",
-  "lastname": "Local",
-  "email": "admin@local.test",
-  "certificateData": "${CERT_B64}",
-  "enabled": "true",
-  "description": "First Administrator"
-}
-EOF
-
-  docker cp /tmp/ilm_first_admin.json core:/tmp/first-admin.json
-
-  REGISTER_RESP=$(docker exec core curl -s -X POST \
+  # Pipe JSON directly into the container via stdin — avoids docker cp path issues on Windows.
+  REGISTER_RESP=$(node -e "
+const fs = require('fs');
+const cert = fs.readFileSync('$COMMON_TMPDIR/ilm_admin_cert_b64.txt','utf8').trim();
+process.stdout.write(JSON.stringify({
+  username:'admin', firstname:'Admin', lastname:'Local',
+  email:'admin@local.test', certificateData:cert,
+  enabled:'true', description:'First Administrator'
+}));
+" | docker exec -i core curl -s -X POST \
     -H 'content-type: application/json' \
-    -d @/tmp/first-admin.json \
+    -d @- \
     http://localhost:8080/api/v1/local/admins)
 
   if echo "$REGISTER_RESP" | grep -q '"superadmin"'; then
@@ -226,8 +263,11 @@ npm install --silent
 ok "Dependencies installed"
 
 info "Writing src/setupProxy.js..."
-cat > src/setupProxy.js << EOF
-const proxyConfig = {
+# Use Node.js to write the file — avoids heredoc quoting/encoding issues on Windows.
+cat > $COMMON_TMPDIR/ilm-write-proxy.cjs << 'JSEOF'
+const fs = require('fs');
+const certUrl = process.argv[2];
+const content = `const proxyConfig = {
     server: {
         proxy: {
             '/api': {
@@ -235,7 +275,7 @@ const proxyConfig = {
                 changeOrigin: true,
                 secure: false,
                 headers: {
-                    'ssl-client-cert': '${CERT_URL}',
+                    'ssl-client-cert': '${certUrl}',
                 },
             },
         },
@@ -243,8 +283,32 @@ const proxyConfig = {
 };
 
 export default proxyConfig;
-EOF
+`;
+fs.writeFileSync('src/setupProxy.js', content, 'utf8');
+JSEOF
+node $COMMON_TMPDIR/ilm-write-proxy.cjs "$CERT_URL"
 ok "src/setupProxy.js written"
+
+# --- Step 9: Prepare test suite ----------------------------------------------
+
+step "9 — Configure test suite"
+
+cd "$REPO_DIR"
+
+if [[ ! -f .env ]]; then
+  cp .env.example .env
+  ok "Created .env from .env.example"
+else
+  warn ".env already exists — skipping"
+fi
+
+info "Installing test suite dependencies..."
+npm install --silent
+ok "Test suite dependencies installed"
+
+info "Installing Chromium for Playwright..."
+npx --yes playwright install chromium
+ok "Chromium installed"
 
 # --- Done --------------------------------------------------------------------
 
@@ -255,13 +319,16 @@ echo -e "${BOLD}============================================${NC}"
 echo ""
 echo -e "  Backend:  ${GREEN}http://localhost:8280${NC}"
 echo ""
-echo -e "  To start the frontend, run:"
-echo -e "    ${BOLD}cd ${ILM_HOME}/fe-administrator && npm start${NC}"
+echo -e "  To start the frontend (run in a new terminal):"
+echo -e "    ${BOLD}cd ${DOCKER_ILM_HOME}/fe-administrator && npm start${NC}"
 echo ""
 echo -e "  The browser will open at ${GREEN}http://localhost:5173${NC}"
 echo -e "  No login required — admin cert is injected via the Vite proxy."
 echo ""
+echo -e "  To run the tests:"
+echo -e "    ${BOLD}cd ${DOCKER_REPO_DIR} && npm test${NC}"
+echo ""
 echo -e "  To stop the platform:"
-echo -e "    ${BOLD}cd ${ILM_HOME}/development-environment${NC}"
+echo -e "    ${BOLD}cd ${DOCKER_ILM_HOME}/development-environment${NC}"
 echo -e "    ${BOLD}docker compose -f czertainly-compose.yml -f postgres-compose.yml --profile database --profile core down${NC}"
 echo ""

@@ -6,13 +6,14 @@ export class DashboardPage extends BasePage {
 
   constructor(page: Page) {
     super(page);
-    this.certCountTile = this.getByTestId('dashboard-counts')
+    this.certCountTile = this.page.getByTestId('dashboard-counts')
       .locator('section')
       .filter({ has: this.page.getByRole('heading', { name: 'Certificates', exact: true }) });
   }
 
   async goto(): Promise<void> {
     await this.page.goto('/');
+    await this.waitForPageToLoad();
     await expect(this.page).toHaveURL(/#\/dashboard\/certificates/i);
   }
 

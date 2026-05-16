@@ -13,8 +13,6 @@ Playwright + TypeScript test suite covering the certificate import scenario from
 | git | any recent |
 | curl | any |
 
-Chromium is installed automatically by Playwright.
-
 ---
 
 ## Quick Start
@@ -27,19 +25,17 @@ Run once on a fresh machine. Clones all repos, starts Docker, registers the admi
 bash setup.sh
 ```
 
-What it does step by step:
-
 | Step | Action |
 |------|--------|
 | 1 | Checks prerequisites (node 18+, docker daemon, git, curl) |
 | 2 | Clones 5 repos into `~/ilm-local/` (skips if already present) |
 | 3 | Creates `~/ilm-local/development-environment/.env` from `.env.example`, sets `CZERTAINLY_SOURCES_BASE_DIR` |
 | 4 | Downloads the dummy Root CA cert into `secrets/trusted_certificates.pem` |
-| 5 | Starts Docker Compose (`czertainly-compose.yml` + `postgres-compose.yml`). Skips rebuild if platform is already healthy |
-| 6 | Polls `GET /api/v1/health/liveness` until `"UP"` (up to 5 min) |
-| 7 | Registers the first administrator via the Local API (skips if already registered) |
-| 8 | Verifies API authentication (`superadmin` role confirmed) |
-| 9 | Runs `npm install` for the frontend and writes `src/setupProxy.js` with the admin cert |
+| 5 | Starts Docker Compose (`czertainly-compose.yml` + `postgres-compose.yml`); polls `GET /api/v1/health/liveness` until `"UP"` (up to 5 min) |
+| 6 | Registers the first administrator via the Local API (skips if already registered) |
+| 7 | Verifies API authentication (`superadmin` role confirmed) |
+| 8 | Runs `npm install` for the frontend and writes `src/setupProxy.js` with the admin cert |
+| 9 | Creates test suite `.env`, installs test suite dependencies, installs Chromium for Playwright |
 
 ### 2. Start the frontend
 
@@ -50,14 +46,7 @@ cd ~/ilm-local/fe-administrator && npm start
 # → http://localhost:5173  (auto-logged in as admin via Vite proxy)
 ```
 
-### 3. Install test dependencies
-
-```bash
-npm install
-npx playwright install chromium
-```
-
-### 4. Run the tests
+### 3. Run the tests
 
 ```bash
 # All tests (API + UI)
@@ -66,8 +55,11 @@ npm test
 # API tests only — no browser, fast
 npm run test:api
 
-# UI tests only — Chromium
+# UI tests only — Chromium (headless)
 npm run test:ui
+
+# UI tests with browser visible
+npm run test:ui -- --headed
 
 # Open HTML report
 npm run test:report
@@ -83,7 +75,6 @@ npm run test:report
 |----------|---------|-------------|
 | `BASE_URL` | `http://localhost:5173` | Frontend (Vite dev server) |
 | `API_BASE_URL` | `http://localhost:8280` | Core API |
-| `ADMIN_CERT_B64` | *(optional — CI only)* | Base64 DER of the admin cert. Locally, `global-setup.ts` downloads `certs/admin.cert.pem` automatically |
 
 ---
 
@@ -139,11 +130,11 @@ The assignment requires verifying three things: the certificate is stored, its p
 | Pure API | Fast, deterministic | Does not exercise the Dashboard UI at all |
 | **Hybrid (chosen)** | Fast + covers all three requirements + demonstrates both skills | Slightly more setup |
 
-The import itself is done via API in both tests — faster and eliminates file-picker complexity. All Dashboard and list assertions in TC-02 run in a real Chromium browser against the live UI.
+The import itself is done via API in both tests — faster and no file-picker to wrestle with. TC-02 runs all Dashboard and list assertions in a real Chromium browser against the live UI.
 
 ### Architecture
 
-The API layer follows the Dependency Inversion Principle: `IHttpClient` is an interface, `BaseApiClient` implements it, and domain clients (`CertificateClient`, `StatisticsClient`) depend on the interface — not the implementation. A single `BaseApiClient` is shared across all domain clients via the worker-scoped `baseApiClient` fixture (one `APIRequestContext` per worker).
+`CertificateClient` and `StatisticsClient` talk to an `IHttpClient` interface, not directly to Playwright's `APIRequestContext`. One `BaseApiClient` instance is shared across both via a worker-scoped fixture, so each worker keeps a single HTTP context without repeated handshakes. Swapping the transport (say, for a mock in unit tests) touches one file.
 
 ### Statistics cross-validation
 
@@ -151,20 +142,6 @@ TC-02 cross-validates the dashboard tile count against `GET /api/v1/statistics` 
 
 ### Test isolation
 
-Each test uses `afterEach` to delete the imported certificate by UUID, keeping runs independent and idempotent regardless of prior state.
+Each test uses `afterEach` to delete the imported certificate by UUID, keeping runs independent and idempotent.
 
 ---
-
-## Assumptions and workarounds
-
-1. **Broken cert URL in assignment.** The URL in the assignment returns 404. The correct path uses `dummy-certificates` (with hyphen). `global-setup.ts` uses the corrected URL.
-
-2. **Certificate file format.** `root-ca.cert.pem` is `openssl x509 -text` output — 95 lines of human-readable text precede the PEM block. `pemToBase64` extracts only the content between `-----BEGIN/END CERTIFICATE-----` markers via regex.
-
-3. **Import endpoint.** `POST /api/v1/certificates/import` does not exist. The correct endpoint is `POST /api/v1/certificates/upload` with body `{ "certificate": "<base64-DER>", "customAttributes": [] }`, confirmed against the API reference.
-
-4. **Certificate list uses POST.** The list endpoint is `POST /api/v1/certificates` (not GET), consistent with CZERTAINLY's filter-by-body convention.
-
-5. **`certificateType` vs `subjectType`.** The platform returns `"certificateType": "X.509"` for all certificates (encoding format). The Root CA distinction is in `"subjectType": "rootCa"`. TC-01 asserts on `subjectType`.
-
-6. **Auth mechanism.** There is no login form. The Vite dev server injects `ssl-client-cert` via its proxy config (`src/setupProxy.js`), so the browser is auto-authenticated. The test suite passes the same URL-encoded base64 DER cert via the `ssl-client-cert` header in `extraHTTPHeaders`.

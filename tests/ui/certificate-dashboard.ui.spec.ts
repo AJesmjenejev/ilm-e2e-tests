@@ -10,9 +10,9 @@
  *   4. Certificate list page shows a row for "Dummy Root CA"
  *   5. That row displays the correct certificate type
  *
- * Strategy: import via API (fast, reliable) then assert in the real browser.
- * API ground-truth cross-validation (statistics endpoint) catches stale-cache
- * or wrong-tenant bugs that a pure +1 DOM check cannot detect.
+ * Strategy: import via API to keep the setup fast, then verify the result in the browser.
+ * The statistics endpoint gives the test a backend source of truth,
+ * so we can catch cases where the dashboard shows a stale or wrong count.
  */
 
 import { test, expect } from '../../fixtures/auth';
