@@ -82,9 +82,10 @@ npm run test:report
 
 ```
 setup.sh                                     # One-command environment bootstrap
-fixtures/
-  auth.ts                                    # Worker-scoped baseApiClient, certificateClient, statisticsClient
 global-setup.ts                              # Downloads certs if missing, handles HTTP redirects
+fixtures/
+  auth.ts                                    # Worker-scoped API clients (ssl-client-cert auth)
+  keywords.ts                                # Composes keyword fixtures on top of authTest — entry point for specs
 types/
   certificate.ts                             # DTOs: UploadCertificateRequest/Response, CertificateDto, StatisticsDto
 utils/
@@ -94,17 +95,23 @@ utils/
     certificate-client.ts                    # CertificateClient: upload, getById, list, remove
     statistics-client.ts                     # StatisticsClient: get() → totalCertificates, totalGroups, …
   cert.ts                                    # pemToBase64 (handles openssl x509 -text output), adminCertBase64
+  constants.ts                               # Shared values: ROOT_CA_COMMON_NAME, CERTIFICATE_TYPE_X509_PATTERN
   env.ts                                     # Typed env loader
   log.ts                                     # log.step / log.ok / log.info
 page-objects/
   base/
-    BasePage.ts                              # Abstract base: getByTestId
+    BasePage.ts                              # Abstract base: owns Page + NavigateTo
+  NavigateTo.ts                              # Centralised URL routes (dashboard, inventory)
   DashboardPage.ts                           # Certificate count tile, list navigation
+  CertificatesPage.ts                        # Inventory: table, upload dialog, delete dialog, row helpers
+keywords/
+  certificate.keywords.ts                    # Domain actions: import/list/get/delete via API; upload/select/delete via UI
+  dashboard.keywords.ts                      # Domain actions: read tile count, assert increment/decrement, cross-check API
 tests/
   api/
     certificate-import.api.spec.ts           # TC-01: pure API
   ui/
-    certificate-dashboard.ui.spec.ts         # TC-02: import via API, assert in browser
+    certificate-dashboard.ui.spec.ts         # TC-02: import + delete via UI, assert in browser + API
 ```
 
 ---
@@ -113,8 +120,8 @@ tests/
 
 | ID | Layer | What is verified |
 |----|-------|-----------------|
-| TC-01 | API | `POST /api/v1/certificates/upload` returns a UUID; `GET /api/v1/certificates/{uuid}` has `commonName: "Dummy Root CA"` and `subjectType` of Root CA variant; certificate appears in list |
-| TC-02 | UI | Import via API; dashboard count increments by 1; tile count matches `GET /api/v1/statistics`; tile link points to `/certificates`; list shows `"Dummy Root CA"` row with correct type |
+| TC-01 | API | `POST /api/v1/certificates/upload` returns a UUID; `GET /api/v1/certificates/{uuid}` has `commonName: "Dummy Root CA"` and `certificateType` matching `/X\.509/i`; certificate appears in list |
+| TC-02 | UI | Import via upload dialog; inventory row visible by common name and UUID with X.509 type badge; dashboard tile count increments by 1; tile count matches `GET /api/v1/statistics`; tile link points to `/certificates`; delete via inventory UI; row removed; certificate gone from API; tile count decrements by 1 and re-matches statistics |
 
 ---
 
@@ -130,11 +137,17 @@ The assignment requires verifying three things: the certificate is stored, its p
 | Pure API | Fast, deterministic | Does not exercise the Dashboard UI at all |
 | **Hybrid (chosen)** | Fast + covers all three requirements + demonstrates both skills | Slightly more setup |
 
-The import itself is done via API in both tests — faster and no file-picker to wrestle with. TC-02 runs all Dashboard and list assertions in a real Chromium browser against the live UI.
+TC-01 stays on the API for speed and determinism. TC-02 drives the full user flow in Chromium — import through the upload dialog, dashboard assertions, delete through the inventory — and cross-validates each visible step against the API.
 
 ### Architecture
 
-`CertificateClient` and `StatisticsClient` talk to an `IHttpClient` interface, not directly to Playwright's `APIRequestContext`. One `BaseApiClient` instance is shared across both via a worker-scoped fixture, so each worker keeps a single HTTP context without repeated handshakes. Swapping the transport (say, for a mock in unit tests) touches one file.
+Layers, top-down: **specs → keywords → page-objects / API clients → transport**.
+
+- **Specs** (`tests/`) describe Given/When/Then at the scenario level only; no locators, no HTTP details.
+- **Keywords** (`keywords/`) — one class per domain (`CertificateKeywords`, `DashboardKeywords`). Each keyword class owns both API and UI methods for its domain. UI methods require a `Page`; specs call `bindPage(page)` in `beforeEach` to enable them. Pure-API specs just don't bind and can't accidentally call UI methods (runtime guard).
+- **Page objects** (`page-objects/`) hold locators only — no assertions, no flow. `BasePage` injects a shared `NavigateTo` so every page can route without duplication.
+- **API clients** (`utils/api/`) talk to an `IHttpClient` interface, not directly to Playwright's `APIRequestContext`. One `BaseApiClient` instance is shared across `CertificateClient` and `StatisticsClient` via a worker-scoped fixture, so each worker keeps a single HTTP context without repeated handshakes. Swapping the transport (say, for a mock in unit tests) touches one file.
+- **Shared values** live in `utils/constants.ts` (e.g. `ROOT_CA_COMMON_NAME`, `CERTIFICATE_TYPE_X509_PATTERN`) — no magic strings in specs or keywords.
 
 ### Statistics cross-validation
 
@@ -142,6 +155,6 @@ TC-02 cross-validates the dashboard tile count against `GET /api/v1/statistics` 
 
 ### Test isolation
 
-Each test uses `afterEach` to delete the imported certificate by UUID, keeping runs independent and idempotent.
+Each test cleans up after itself in `afterEach` — TC-01 deletes by the UUID it captured during upload; TC-02 deletes any leftover certificates whose common name matches `ROOT_CA_COMMON_NAME` (also done in `beforeEach` so a previously failed run can't poison the next one). Runs are independent and idempotent.
 
 ---

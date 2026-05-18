@@ -11,7 +11,7 @@ import { StatisticsClient } from '../utils/api/statistics-client';
 
 export { expect };
 
-type WorkerFixtures = {
+export type ApiWorkerFixtures = {
   /**
    * Shared HTTP client for the lifetime of a worker — one APIRequestContext,
    * one ssl-client-cert handshake. Domain clients (certificateClient,
@@ -22,7 +22,8 @@ type WorkerFixtures = {
   statisticsClient: StatisticsClient;
 };
 
-export const test = base.extend<NonNullable<unknown>, WorkerFixtures>({
+/** Playwright test with authenticated API clients (worker-scoped). */
+export const authTest = base.extend<{}, ApiWorkerFixtures>({
   baseApiClient: [
     async ({}, use) => {
       const env = loadEnv();
